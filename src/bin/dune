@@ -1,0 +1,9 @@
+(executable
+ (modules main)
+ (name main)
+ (libraries opentelemetry opentelemetry-client-ocurl opentelemetry.trace))
+
+(executable
+ (name main2)
+ (modules main2)
+ (libraries opentelemetry opentelemetry-client-ocurl))
