@@ -7,3 +7,15 @@
  (name main2)
  (modules main2)
  (libraries opentelemetry opentelemetry-client-ocurl))
+
+(executable
+ (name cleanup_blocking)
+ (libraries unix)
+ (modules cleanup_blocking))
+
+(executable
+ (name cleanup_lwt)
+ (preprocess
+  (pps lwt_ppx))
+ (libraries lwt lwt.unix)
+ (modules cleanup_lwt))

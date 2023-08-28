@@ -1,0 +1,6 @@
+(library
+ (name opentelemetry_client_stdout_lwt)
+ (synopsis "Opentelemetry collector using stdout+lwt+unix")
+ (preprocess
+  (pps lwt_ppx))
+ (libraries opentelemetry lwt lwt.unix pbrt mtime mtime.clock.os))
