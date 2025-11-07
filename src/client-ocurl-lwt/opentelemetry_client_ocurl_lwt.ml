@@ -123,7 +123,7 @@ end = struct
              (Printexc.to_string e))
       in
       Lwt.return @@ Error err
-    | Ok (Ok { Ezcurl.code; body; _ }) ->
+    | Ok (Ok { Ezcurl_core.code; body; _ }) ->
       if code >= 200 && code < 300 then (
         match decode with
         | `Ret x -> Lwt.return @@ Ok x
@@ -238,7 +238,7 @@ let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
       match Batch.pop_if_ready ?force ~now batch_metrics with
       | None -> Lwt.return false
       | Some l ->
-        let batch = AList.pop_all gc_metrics :: l in
+        let batch = List.rev_append (AList.pop_all gc_metrics) l in
         let+ () = send_metrics_http httpc batch in
         true
 
