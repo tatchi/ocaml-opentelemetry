@@ -27,12 +27,11 @@ val setup :
       enable/disable the setup depending on CLI arguments or environment.
     @param config configuration to use
     @param stop
-      an atomic boolean. When it becomes true, background threads will all stop
+      an atomic boolean. When it becomes true, background tasks will all stop
       after a little while. *)
 
 val remove_backend : unit -> unit Lwt.t
-(** Shutdown current backend
-    @since NEXT_RELEASE *)
+(** Shutdown current backend *)
 
 val with_setup :
   ?stop:bool Atomic.t ->
