@@ -84,6 +84,6 @@ let@ scope = Otel.Trace.with_ "operation_name" ~attrs:["key", `String "value"] i
 Tests are organized by component:
 - `tests/core/` - Core functionality tests
 - `tests/client/` - Client library tests  
-- `tests/ocurl/` and `tests/cohttp/` - HTTP client tests
+- `tests/ocurl/`, `tests/ocurl-lwt/`, and `tests/cohttp/` - HTTP client tests
 
 Use `make test` or `dune runtest` to run the full test suite.
