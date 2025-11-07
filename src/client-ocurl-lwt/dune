@@ -1,0 +1,16 @@
+(library
+ (name opentelemetry_client_ocurl_lwt)
+ (public_name opentelemetry-client-ocurl-lwt)
+ (synopsis "Opentelemetry collector using ezcurl-lwt")
+ (preprocess
+  (pps lwt_ppx))
+ (libraries
+  opentelemetry
+  opentelemetry.client
+  pbrt
+  mtime
+  mtime.clock.os
+  ezcurl-lwt
+  ezcurl.core
+  lwt
+  lwt.unix))
