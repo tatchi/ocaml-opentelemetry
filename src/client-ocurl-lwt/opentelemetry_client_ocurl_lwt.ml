@@ -24,7 +24,7 @@ let last_gc_metrics = Atomic.make (Mtime_clock.now ())
 
 let timeout_gc_metrics = Mtime.Span.(20 * s)
 
-let gc_metrics = ref []
+let gc_metrics = AList.make ()
 (* side channel for GC, appended to {!E_metrics}'s data *)
 
 (* capture current GC metrics if {!needs_gc_metrics} is true,
@@ -44,7 +44,7 @@ let sample_gc_metrics_if_needed () =
         ~attrs:(Opentelemetry.GC_metrics.get_runtime_attributes ())
       @@ Opentelemetry.GC_metrics.get_metrics ()
     in
-    gc_metrics := l :: !gc_metrics
+    AList.add gc_metrics l
   )
 
 type error =
@@ -238,8 +238,7 @@ let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
       match Batch.pop_if_ready ?force ~now batch_metrics with
       | None -> Lwt.return false
       | Some l ->
-        let batch = !gc_metrics @ l in
-        gc_metrics := [];
+        let batch = AList.pop_all gc_metrics :: l in
         let+ () = send_metrics_http httpc batch in
         true
 
@@ -296,7 +295,7 @@ let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
     let push_to_batch b e =
       match Batch.push b e with
       | `Ok -> ()
-      | `Dropped -> Atomic.incr n_errors
+      | `Dropped -> Atomic.incr n_dropped
 
     let push_trace e =
       let@ () = guard_exn_ "push trace" in
