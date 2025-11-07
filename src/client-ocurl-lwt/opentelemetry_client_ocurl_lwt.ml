@@ -100,12 +100,14 @@ end = struct
 
   (* send the content to the remote endpoint/path *)
   let send (_self : t) ~url ~decode (bod : string) : ('a, error) result Lwt.t =
-    let open Lwt.Syntax in
-
     let* r =
       try%lwt
         let headers = Config.Env.get_headers () in
-        let headers = ("Content-Type", "application/x-protobuf") :: headers in
+        let headers =
+          ("Content-Type", "application/x-protobuf")
+          :: ("Accept", "application/x-protobuf")
+          :: headers
+        in
 
         let+ result =
           Ezcurl_lwt.post ~headers ~params:[] ~url ~content:(`String bod) ()
