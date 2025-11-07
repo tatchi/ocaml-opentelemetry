@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add opentelemetry-client-ocurl-lwt package that combines ezcurl-lwt with Lwt for async HTTP telemetry export
+**Goal:** Add opentelemetry-client-ocurl-lwt package using ezcurl-lwt for fully async Lwt-based HTTP telemetry export
 
-**Architecture:** Hybrid approach combining client-ocurl's thread-based batching (B_queue, Batch modules) with ezcurl-lwt's async HTTP. Main thread manages batches, Lwt promises handle async HTTP sends via ezcurl-lwt instead of blocking ezcurl calls.
+**Architecture:** Fully Lwt-based like client-cohttp-lwt. Uses opentelemetry.client.Batch for batching, ezcurl-lwt for HTTP. No threads, all async. Push triggers async emit checks, ticker thread ensures timeout-based emits.
 
 **Tech Stack:** OCaml, Dune, ezcurl-lwt, Lwt, opentelemetry.client (shared batching/config), Pbrt
 
@@ -38,11 +38,8 @@ Create `src/client-ocurl-lwt/dune`:
   (pps lwt_ppx))
  (libraries
   opentelemetry
-  opentelemetry.atomic
   opentelemetry.client
-  curl
   pbrt
-  threads
   mtime
   mtime.clock.os
   ezcurl-lwt
@@ -57,11 +54,10 @@ Create `src/client-ocurl-lwt/common_.ml`:
 
 ```ocaml
 module Atomic = Opentelemetry_atomic.Atomic
-include Opentelemetry.Lock
+
+let[@inline] ( let@ ) f x = f x
 
 let spf = Printf.sprintf
-
-let ( let@ ) = ( @@ )
 
 let tid () = Thread.id @@ Thread.self ()
 ```
@@ -71,22 +67,7 @@ let tid () = Thread.id @@ Thread.self ()
 Create `src/client-ocurl-lwt/config.mli`:
 
 ```ocaml
-(** Configuration for the ocurl-lwt backend *)
-
-type t = {
-  bg_threads: int;
-      (** Number of background threads for HTTP sends. Default [4].
-          Adjusted to be at least [1] and at most [32]. *)
-  ticker_thread: bool;
-      (** If true, start a thread that regularly checks if signals should be
-          sent to the collector. Default [true] *)
-  ticker_interval_ms: int;
-      (** Interval for ticker thread, in milliseconds. Only useful if
-          [ticker_thread] is [true]. Clamped between [2 ms] and [60s].
-          Default 500. *)
-  common: Opentelemetry_client.Config.t;
-      (** Common configuration options *)
-}
+type t = Opentelemetry_client.Config.t
 (** Configuration.
 
     To build one, use {!make} below. This might be extended with more fields in
@@ -94,13 +75,7 @@ type t = {
 
 val pp : Format.formatter -> t -> unit
 
-val make :
-  (?bg_threads:int ->
-  ?ticker_thread:bool ->
-  ?ticker_interval_ms:int ->
-  unit ->
-  t)
-  Opentelemetry_client.Config.make
+val make : (unit -> t) Opentelemetry_client.Config.make
 (** Make a configuration {!t}. *)
 
 module Env : Opentelemetry_client.Config.ENV
@@ -111,24 +86,11 @@ module Env : Opentelemetry_client.Config.ENV
 Create `src/client-ocurl-lwt/config.ml`:
 
 ```ocaml
-type t = {
-  bg_threads: int;
-  ticker_thread: bool;
-  ticker_interval_ms: int;
-  common: Opentelemetry_client.Config.t;
-}
+type t = Opentelemetry_client.Config.t
 
-let pp out self =
-  Format.fprintf out
-    "{@[bg_threads=%d;@ ticker_thread=%B;@ ticker_interval_ms=%d;@ common=%a@]}"
-    self.bg_threads self.ticker_thread self.ticker_interval_ms
-    Opentelemetry_client.Config.pp self.common
+let pp = Opentelemetry_client.Config.pp
 
-let make ?(bg_threads = 4) ?(ticker_thread = true) ?(ticker_interval_ms = 500) =
-  fun common_config ->
-    let bg_threads = max 1 (min 32 bg_threads) in
-    let common = common_config () in
-    { bg_threads; ticker_thread; ticker_interval_ms; common }
+let make = Opentelemetry_client.Config.make
 
 module Env = Opentelemetry_client.Config.Env
 ```
@@ -150,8 +112,6 @@ Modify `dune-project`, add after the `opentelemetry-client-ocurl` package defini
   (odoc :with-doc)
   (ezcurl-lwt
    (>= 0.2.3))
-  (ezcurl
-   (>= 0.2.3))
   ocurl
   (lwt
    (>= "5.3"))
@@ -163,7 +123,7 @@ Modify `dune-project`, add after the `opentelemetry-client-ocurl` package defini
 
 **Step 7: Build to verify structure**
 
-Run: `dune build @all`
+Run: `dune build src/client-ocurl-lwt/`
 Expected: Build succeeds or fails only because main .mli/.ml files are empty
 
 **Step 8: Commit**
@@ -172,7 +132,7 @@ Expected: Build succeeds or fails only because main .mli/.ml files are empty
 git add src/client-ocurl-lwt/ dune-project
 git commit -m "feat: add client-ocurl-lwt package structure
 
-Create new package combining ezcurl-lwt + Lwt for async telemetry export
+Create new package using ezcurl-lwt for fully async Lwt-based export
 
 🤖 Generated with Claude Code
 
@@ -181,94 +141,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ---
 
-## Task 2: Implement core backend with B_queue and Batch modules
-
-**Files:**
-- Create: `src/client-ocurl-lwt/b_queue.mli`
-- Create: `src/client-ocurl-lwt/b_queue.ml`
-- Create: `src/client-ocurl-lwt/batch.mli`
-- Create: `src/client-ocurl-lwt/batch.ml`
-
-**Step 1: Copy b_queue.mli from client-ocurl**
-
-Create `src/client-ocurl-lwt/b_queue.mli` (identical to client-ocurl version):
-
-```ocaml
-(** Basic Blocking Queue *)
-
-type 'a t
-
-val create : unit -> _ t
-
-exception Closed
-
-val push : 'a t -> 'a -> unit
-(** [push q x] pushes [x] into [q], and returns [()].
-    @raise Closed if [close q] was previously called.*)
-
-val pop : 'a t -> 'a
-(** [pop q] pops the next element in [q]. It might block until an element comes.
-    @raise Closed if the queue was closed before a new element was available. *)
-
-val pop_all : 'a t -> 'a Queue.t -> unit
-(** [pop_all q into] pops all the elements of [q] and moves them into [into]. It
-    might block until an element comes.
-    @raise Closed if the queue was closed before a new element was available. *)
-
-val close : _ t -> unit
-(** Close the queue, meaning there won't be any more [push] allowed. *)
-```
-
-**Step 2: Copy b_queue.ml from client-ocurl**
-
-Run: `cp src/client-ocurl/b_queue.ml src/client-ocurl-lwt/b_queue.ml`
-
-**Step 3: Copy batch.mli from client-ocurl**
-
-Create `src/client-ocurl-lwt/batch.mli` (identical to client-ocurl version):
-
-```ocaml
-(** List of lists with length *)
-
-type 'a t
-
-val create : unit -> 'a t
-
-val push : 'a t -> 'a list -> unit
-
-val len : _ t -> int
-
-val time_started : _ t -> Mtime.t
-(** Time at which the batch most recently became non-empty *)
-
-val pop_all : 'a t -> 'a list list
-```
-
-**Step 4: Copy batch.ml from client-ocurl**
-
-Run: `cp src/client-ocurl/batch.ml src/client-ocurl-lwt/batch.ml`
-
-**Step 5: Build to verify modules compile**
-
-Run: `dune build src/client-ocurl-lwt/`
-Expected: Build succeeds for b_queue and batch modules
-
-**Step 6: Commit**
-
-```bash
-git add src/client-ocurl-lwt/b_queue.* src/client-ocurl-lwt/batch.*
-git commit -m "feat: add b_queue and batch modules to client-ocurl-lwt
-
-Copy blocking queue and batching logic from client-ocurl
-
-🤖 Generated with Claude Code
-
-Co-Authored-By: Claude <noreply@anthropic.com>"
-```
-
----
-
-## Task 3: Implement public interface (.mli file)
+## Task 2: Implement public interface (.mli file)
 
 **Files:**
 - Modify: `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.mli`
@@ -278,12 +151,18 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 Write to `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.mli`:
 
 ```ocaml
+(*
+   TODO: more options from
+   https://opentelemetry.io/docs/reference/specification/protocol/exporter/
+   *)
+
+open Common_
+
 val get_headers : unit -> (string * string) list
 
 val set_headers : (string * string) list -> unit
 (** Set http headers that are sent on every http query to the collector. *)
 
-module Atomic = Opentelemetry_atomic.Atomic
 module Config = Config
 
 val create_backend :
@@ -304,18 +183,19 @@ val setup :
       an atomic boolean. When it becomes true, background threads will all stop
       after a little while. *)
 
-val remove_backend : unit -> unit
-(** Remove current backend *)
+val remove_backend : unit -> unit Lwt.t
+(** Shutdown current backend
+    @since NEXT_RELEASE *)
 
 val with_setup :
   ?stop:bool Atomic.t ->
   ?config:Config.t ->
   ?enable:bool ->
   unit ->
-  (unit -> 'a) ->
-  'a
+  (unit -> 'a Lwt.t) ->
+  'a Lwt.t
 (** [with_setup () f] is like [setup(); f()] but takes care of cleaning up after
-    [f()] returns. See {!setup} for more details. *)
+    [f()] returns See {!setup} for more details. *)
 ```
 
 **Step 2: Build to check interface**
@@ -329,7 +209,7 @@ Expected: Build fails with "Unbound module" errors (implementation not done yet)
 git add src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.mli
 git commit -m "feat: add public interface for client-ocurl-lwt
 
-Define API matching client-ocurl pattern
+Define API matching client-cohttp-lwt pattern with Lwt
 
 🤖 Generated with Claude Code
 
@@ -338,7 +218,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ---
 
-## Task 4: Implement Backend_impl with Lwt HTTP sending
+## Task 3: Implement HTTP client module
 
 **Files:**
 - Modify: `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`
@@ -355,14 +235,18 @@ Write initial part of `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
 
 module OT = Opentelemetry
 module Config = Config
-module Self_trace = Opentelemetry_client.Self_trace
 module Signal = Opentelemetry_client.Signal
+module Batch = Opentelemetry_client.Batch
 open Opentelemetry
-include Common_
+open Common_
+
+let set_headers = Config.Env.set_headers
 
 let get_headers = Config.Env.get_headers
 
-let set_headers = Config.Env.set_headers
+external reraise : exn -> 'a = "%reraise"
+(** This is equivalent to [Lwt.reraise]. We inline it here so we don't force to
+    use Lwt's latest version *)
 
 let needs_gc_metrics = Atomic.make false
 
@@ -370,15 +254,15 @@ let last_gc_metrics = Atomic.make (Mtime_clock.now ())
 
 let timeout_gc_metrics = Mtime.Span.(20 * s)
 
-(** side channel for GC, appended to metrics batch data *)
-let gc_metrics = AList.make ()
+let gc_metrics = ref []
+(* side channel for GC, appended to {!E_metrics}'s data *)
 
-(** capture current GC metrics if {!needs_gc_metrics} is true or it has been a
-    long time since the last GC metrics collection, and push them into
-    {!gc_metrics} for later collection *)
+(* capture current GC metrics if {!needs_gc_metrics} is true,
+   or it has been a long time since the last GC metrics collection,
+   and push them into {!gc_metrics} for later collection *)
 let sample_gc_metrics_if_needed () =
   let now = Mtime_clock.now () in
-  let alarm = Atomic.exchange needs_gc_metrics false in
+  let alarm = Atomic.compare_and_set needs_gc_metrics true false in
   let timeout () =
     let elapsed = Mtime.span now (Atomic.get last_gc_metrics) in
     Mtime.Span.compare elapsed timeout_gc_metrics > 0
@@ -390,347 +274,142 @@ let sample_gc_metrics_if_needed () =
         ~attrs:(Opentelemetry.GC_metrics.get_runtime_attributes ())
       @@ Opentelemetry.GC_metrics.get_metrics ()
     in
-    AList.add gc_metrics l
+    gc_metrics := l :: !gc_metrics
   )
+
+type error =
+  [ `Status of int * Opentelemetry.Proto.Status.status
+  | `Failure of string
+  | `Sysbreak
+  ]
 
 let n_errors = Atomic.make 0
 
 let n_dropped = Atomic.make 0
 
-(** Something sent to the collector *)
-module Event = struct
-  open Opentelemetry.Proto
-
-  type t =
-    | E_metric of Metrics.resource_metrics list
-    | E_trace of Trace.resource_spans list
-    | E_logs of Logs.resource_logs list
-    | E_tick
-    | E_flush_all  (** Flush all batches *)
-end
-
-(** Something to be sent via HTTP *)
-module To_send = struct
-  open Opentelemetry.Proto
-
-  type t =
-    | Send_metric of Metrics.resource_metrics list list
-    | Send_trace of Trace.resource_spans list list
-    | Send_logs of Logs.resource_logs list list
-end
-```
-
-**Step 2: Add thread helpers and hex conversion**
-
-Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
-
-```ocaml
-(** start a thread in the background, running [f()] *)
-let start_bg_thread (f : unit -> unit) : Thread.t =
-  let unix_run () =
-    let signals =
-      [
-        Sys.sigusr1;
-        Sys.sigusr2;
-        Sys.sigterm;
-        Sys.sigpipe;
-        Sys.sigalrm;
-        Sys.sigstop;
-      ]
+let report_err_ = function
+  | `Sysbreak -> Printf.eprintf "opentelemetry: ctrl-c captured, stopping\n%!"
+  | `Failure msg ->
+    Format.eprintf "@[<2>opentelemetry: export failed: %s@]@." msg
+  | `Status (code, { Opentelemetry.Proto.Status.code = scode; message; details })
+    ->
+    let pp_details out l =
+      List.iter
+        (fun s -> Format.fprintf out "%S;@ " (Bytes.unsafe_to_string s))
+        l
     in
-    ignore (Thread.sigmask Unix.SIG_BLOCK signals : _ list);
-    f ()
-  in
-  (* no signals on Windows *)
-  let run () =
-    if Sys.win32 then
-      f ()
-    else
-      unix_run ()
-  in
-  Thread.create run ()
-
-let str_to_hex (s : string) : string =
-  let i_to_hex (i : int) =
-    if i < 10 then
-      Char.chr (i + Char.code '0')
-    else
-      Char.chr (i - 10 + Char.code 'a')
-  in
-
-  let res = Bytes.create (2 * String.length s) in
-  for i = 0 to String.length s - 1 do
-    let n = Char.code (String.get s i) in
-    Bytes.set res (2 * i) (i_to_hex ((n land 0xf0) lsr 4));
-    Bytes.set res ((2 * i) + 1) (i_to_hex (n land 0x0f))
-  done;
-  Bytes.unsafe_to_string res
+    Format.eprintf
+      "@[<2>opentelemetry: export failed with@ http code=%d@ status \
+       {@[code=%ld;@ message=%S;@ details=[@[%a@]]@]}@]@."
+      code scode
+      (Bytes.unsafe_to_string message)
+      pp_details details
 ```
 
-**Step 3: Implement Backend_impl module with Lwt HTTP**
+**Step 2: Implement HTTP client module**
 
 Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
 
 ```ocaml
-module Backend_impl : sig
+module Httpc : sig
   type t
 
-  val create : stop:bool Atomic.t -> config:Config.t -> unit -> t
+  val create : unit -> t
 
-  val send_event : t -> Event.t -> unit
+  val send :
+    t ->
+    url:string ->
+    decode:[ `Dec of Pbrt.Decoder.t -> 'a | `Ret of 'a ] ->
+    string ->
+    ('a, error) result Lwt.t
 
-  val shutdown : t -> on_done:(unit -> unit) -> unit
+  val cleanup : t -> unit
 end = struct
   open Opentelemetry.Proto
+  open Lwt.Syntax
 
-  type t = {
-    stop: bool Atomic.t;
-    cleaned: bool Atomic.t;  (** True when we cleaned up after closing *)
-    config: Config.t;
-    q: Event.t B_queue.t;  (** Queue to receive data from the user's code *)
-    mutable main_th: Thread.t option;  (** Thread that listens on [q] *)
-    send_q: To_send.t B_queue.t;  (** Queue for the send worker threads *)
-    mutable send_threads: Thread.t array;  (** Threads that send data via http *)
-  }
+  type t = unit
 
-  let send_http_ ~stop ~(config : Config.t) (client : Curl.t) ~url data : unit =
-    let@ _sc =
-      Self_trace.with_ ~kind:Span.Span_kind_producer "otel-ocurl-lwt.send-http"
+  let create () : t = ()
+
+  let cleanup _self = ()
+
+  (* send the content to the remote endpoint/path *)
+  let send (_self : t) ~url ~decode (bod : string) : ('a, error) result Lwt.t =
+    let open Lwt.Syntax in
+
+    let* r =
+      try%lwt
+        let headers = Config.Env.get_headers () in
+        let headers = ("Content-Type", "application/x-protobuf") :: headers in
+
+        let+ result =
+          Ezcurl_lwt.post ~headers ~params:[] ~url ~content:(`String bod) ()
+        in
+        Ok result
+      with e -> Lwt.return @@ Error e
     in
-
-    if Config.Env.get_debug () then
-      Printf.eprintf "opentelemetry: send http POST to %s (%dB)\n%!" url
-        (String.length data);
-    let headers =
-      ("Content-Type", "application/x-protobuf") :: config.common.headers
-    in
-
-    (* Use Lwt.wait + wakeup to bridge Lwt and threads *)
-    let result_promise, result_resolver = Lwt.wait () in
-
-    (* Launch async Lwt HTTP request *)
-    Lwt.async (fun () ->
-      let open Lwt.Syntax in
-      let@ _sc =
-        Self_trace.with_ ~kind:Span.Span_kind_internal "ezcurl-lwt.post"
-          ~attrs:[ "sz", `Int (String.length data); "url", `String url ]
+    match r with
+    | Error e ->
+      let err =
+        `Failure
+          (spf "sending signals via http POST to %S\nfailed with:\n%s" url
+             (Printexc.to_string e))
       in
-      let* result =
-        Ezcurl_lwt.post ~headers ~client ~params:[] ~url ~content:(`String data) ()
-      in
-      Lwt.wakeup result_resolver result;
-      Lwt.return ()
-    );
-
-    (* Block thread until result available *)
-    match Lwt_main.run result_promise with
-    | Ok { code; _ } when code >= 200 && code < 300 ->
-      if Config.Env.get_debug () then
-        Printf.eprintf "opentelemetry: got response code=%d\n%!" code
-    | Ok { code; body; headers = _; info = _ } ->
-      Atomic.incr n_errors;
-      Self_trace.add_event _sc
-      @@ Opentelemetry.Event.make "error" ~attrs:[ "code", `Int code ];
-
-      if Config.Env.get_debug () then (
+      Lwt.return @@ Error err
+    | Ok (Ok { Ezcurl.code; body; _ }) ->
+      if code >= 200 && code < 300 then (
+        match decode with
+        | `Ret x -> Lwt.return @@ Ok x
+        | `Dec f ->
+          let dec = Pbrt.Decoder.of_string body in
+          let r =
+            try Ok (f dec)
+            with e ->
+              let bt = Printexc.get_backtrace () in
+              Error
+                (`Failure
+                   (spf "decoding failed with:\n%s\n%s" (Printexc.to_string e)
+                      bt))
+          in
+          Lwt.return r
+      ) else (
         let dec = Pbrt.Decoder.of_string body in
-        let body =
+
+        let r =
           try
             let status = Status.decode_pb_status dec in
-            Format.asprintf "%a" Status.pp_status status
-          with _ ->
-            spf "(could not decode status)\nraw bytes: %s" (str_to_hex body)
+            Error (`Status (code, status))
+          with e ->
+            let bt = Printexc.get_backtrace () in
+            Error
+              (`Failure
+                 (spf
+                    "httpc: decoding of status (url=%S, code=%d) failed with:\n\
+                     %s\n\
+                     status: %S\n\
+                     %s"
+                    url code (Printexc.to_string e) body bt))
         in
-        Printf.eprintf
-          "opentelemetry: error while sending data to %s:\n  code=%d\n  %s\n%!"
-          url code body
-      );
-      ()
-    | exception Sys.Break ->
-      Printf.eprintf "ctrl-c captured, stopping\n%!";
-      Atomic.set stop true
-    | Error (code, msg) ->
-      (* TODO: log error _via_ otel? *)
-      Atomic.incr n_errors;
-
-      Printf.eprintf
-        "opentelemetry: export failed:\n  %s\n  curl code: %s\n  url: %s\n%!"
-        msg (Curl.strerror code) url;
-
-      (* avoid crazy error loop *)
-      Thread.delay 3.
-
-  let[@inline] send_event (self : t) ev : unit = B_queue.push self.q ev
-
-  (** Thread that, in a loop, reads from [q] to get the next message to send via
-      http *)
-  let bg_thread_loop (self : t) : unit =
-    Ezcurl.with_client ?set_opts:None @@ fun client ->
-    let config = self.config in
-    let stop = self.stop in
-    let send ~name ~url ~conv signals =
-      let l = List.fold_left (fun acc l -> List.rev_append l acc) [] signals in
-      let@ _sp =
-        Self_trace.with_ ~kind:Span_kind_producer name
-          ~attrs:[ "n", `Int (List.length l) ]
-      in
-      conv l |> send_http_ ~stop ~config ~url client
-    in
-    try
-      while not (Atomic.get stop) do
-        let msg = B_queue.pop self.send_q in
-        match msg with
-        | To_send.Send_trace tr ->
-          send ~name:"send-traces" ~conv:Signal.Encode.traces
-            ~url:config.common.url_traces tr
-        | To_send.Send_metric ms ->
-          send ~name:"send-metrics" ~conv:Signal.Encode.metrics
-            ~url:config.common.url_metrics ms
-        | To_send.Send_logs logs ->
-          send ~name:"send-logs" ~conv:Signal.Encode.logs
-            ~url:config.common.url_logs logs
-      done
-    with B_queue.Closed -> ()
-
-  type batches = {
-    traces: Proto.Trace.resource_spans Batch.t;
-    logs: Proto.Logs.resource_logs Batch.t;
-    metrics: Proto.Metrics.resource_metrics Batch.t;
-  }
-
-  let batch_max_size_ = 200
-
-  let should_send_batch_ ?(side = []) ~config ~now (b : _ Batch.t) : bool =
-    (Batch.len b > 0 || side != [])
-    && (Batch.len b >= batch_max_size_
-       ||
-       let timeout = Mtime.Span.(config.Config.common.batch_timeout_ms * ms) in
-       let elapsed = Mtime.span now (Batch.time_started b) in
-       Mtime.Span.compare elapsed timeout >= 0)
-
-  let main_thread_loop (self : t) : unit =
-    let local_q = Queue.create () in
-    let config = self.config in
-
-    (* keep track of batches *)
-    let batches =
-      {
-        traces = Batch.create ();
-        logs = Batch.create ();
-        metrics = Batch.create ();
-      }
-    in
-
-    let send_metrics () =
-      let metrics = AList.pop_all gc_metrics :: Batch.pop_all batches.metrics in
-      B_queue.push self.send_q (To_send.Send_metric metrics)
-    in
-
-    let send_logs () =
-      B_queue.push self.send_q (To_send.Send_logs (Batch.pop_all batches.logs))
-    in
-
-    let send_traces () =
-      B_queue.push self.send_q
-        (To_send.Send_trace (Batch.pop_all batches.traces))
-    in
-
-    try
-      while not (Atomic.get self.stop) do
-        (* read multiple events at once *)
-        B_queue.pop_all self.q local_q;
-
-        (* are we asked to flush all events? *)
-        let must_flush_all = ref false in
-
-        (* how to process a single event *)
-        let process_ev (ev : Event.t) : unit =
-          match ev with
-          | Event.E_metric m -> Batch.push batches.metrics m
-          | Event.E_trace tr -> Batch.push batches.traces tr
-          | Event.E_logs logs -> Batch.push batches.logs logs
-          | Event.E_tick ->
-            (* the only impact of "tick" is that it wakes us up regularly *)
-            ()
-          | Event.E_flush_all -> must_flush_all := true
-        in
-
-        Queue.iter process_ev local_q;
-        Queue.clear local_q;
-
-        if !must_flush_all then (
-          if Batch.len batches.metrics > 0 || not (AList.is_empty gc_metrics)
-          then
-            send_metrics ();
-          if Batch.len batches.logs > 0 then send_logs ();
-          if Batch.len batches.traces > 0 then send_traces ()
-        ) else (
-          let now = Mtime_clock.now () in
-          if
-            should_send_batch_ ~config ~now batches.metrics
-              ~side:(AList.get gc_metrics)
-          then
-            send_metrics ();
-
-          if should_send_batch_ ~config ~now batches.traces then send_traces ();
-          if should_send_batch_ ~config ~now batches.logs then send_logs ()
-        )
-      done
-    with B_queue.Closed -> ()
-
-  let create ~stop ~config () : t =
-    let n_send_threads = max 2 config.Config.bg_threads in
-    let self =
-      {
-        stop;
-        config;
-        q = B_queue.create ();
-        send_threads = [||];
-        send_q = B_queue.create ();
-        cleaned = Atomic.make false;
-        main_th = None;
-      }
-    in
-
-    let main_th = start_bg_thread (fun () -> main_thread_loop self) in
-    self.main_th <- Some main_th;
-
-    self.send_threads <-
-      Array.init n_send_threads (fun _i ->
-          start_bg_thread (fun () -> bg_thread_loop self));
-
-    self
-
-  let shutdown self ~on_done : unit =
-    Atomic.set self.stop true;
-    if not (Atomic.exchange self.cleaned true) then (
-      (* empty batches *)
-      send_event self Event.E_flush_all;
-      (* close the incoming queue, wait for the thread to finish
-         before we start cutting off the background threads, so that they
-         have time to receive the final batches *)
-      B_queue.close self.q;
-      Option.iter Thread.join self.main_th;
-      (* close send queues, then wait for all threads *)
-      B_queue.close self.send_q;
-      Array.iter Thread.join self.send_threads
-    );
-    on_done ()
+        Lwt.return r
+      )
+    | Ok (Error (code, msg)) ->
+      Lwt.return @@ Error (`Failure (spf "curl error %s: %s" (Curl.strerror code) msg))
 end
 ```
 
-**Step 4: Build to verify Backend_impl compiles**
+**Step 3: Build to verify Httpc compiles**
 
 Run: `dune build src/client-ocurl-lwt/`
-Expected: Partial build success, may have issues with remaining functions
+Expected: Partial build, may fail on missing emitter functions
 
-**Step 5: Commit**
+**Step 4: Commit**
 
 ```bash
 git add src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml
-git commit -m "feat: implement Backend_impl with ezcurl-lwt
+git commit -m "feat: implement HTTP client with ezcurl-lwt
 
-Add event queuing, batching, and Lwt-based HTTP sending
+Add Lwt-based HTTP POST using ezcurl-lwt
 
 🤖 Generated with Claude Code
 
@@ -739,148 +418,392 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ---
 
-## Task 5: Implement public API functions
+## Task 4: Implement EMITTER module
 
 **Files:**
 - Modify: `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`
 
-**Step 1: Add create_backend function**
+**Step 1: Add EMITTER interface**
 
-Append to `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
+Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
 
 ```ocaml
-let create_backend ?(stop = Atomic.make false)
-    ?(config : Config.t = Config.make ()) () : (module Collector.BACKEND) =
-  let module M = struct
-    open Opentelemetry.Proto
-    open Opentelemetry.Collector
+(** An emitter. This is used by {!Backend} below to forward traces/metrics/…
+    from the program to whatever collector client we have. *)
+module type EMITTER = sig
+  open Opentelemetry.Proto
 
-    let backend = Backend_impl.create ~stop ~config ()
+  val push_trace : Trace.resource_spans list -> unit
 
-    let send_trace : Trace.resource_spans list sender =
-      {
-        send =
-          (fun l ~ret ->
-            Backend_impl.send_event backend (Event.E_trace l);
-            ret ());
-      }
+  val push_metrics : Metrics.resource_metrics list -> unit
 
-    let last_sent_metrics = Atomic.make (Mtime_clock.now ())
+  val push_logs : Logs.resource_logs list -> unit
 
-    (* send metrics from time to time *)
-    let timeout_sent_metrics = Mtime.Span.(5 * s)
+  val set_on_tick_callbacks : (unit -> unit) AList.t -> unit
 
-    let signal_emit_gc_metrics () =
-      if config.common.debug then
-        Printf.eprintf "opentelemetry: emit GC metrics requested\n%!";
-      Atomic.set needs_gc_metrics true
+  val tick : unit -> unit
 
-    let additional_metrics () : Metrics.resource_metrics list =
-      (* add exporter metrics to the lot? *)
-      let last_emit = Atomic.get last_sent_metrics in
-      let now = Mtime_clock.now () in
-      let add_own_metrics =
-        let elapsed = Mtime.span last_emit now in
-        Mtime.Span.compare elapsed timeout_sent_metrics > 0
-      in
+  val cleanup : on_done:(unit -> unit) -> unit -> unit
+end
+```
 
-      (* there is a possible race condition here, as several threads might update
-         metrics at the same time. But that's harmless. *)
-      if add_own_metrics then (
-        Atomic.set last_sent_metrics now;
-        let open OT.Metrics in
-        let now_unix = OT.Timestamp_ns.now_unix_ns () in
-        [
-          make_resource_metrics
-            [
-              sum ~name:"otel.export.dropped" ~is_monotonic:true
-                [
-                  int ~start_time_unix_nano:now_unix ~now:now_unix
-                    (Atomic.get n_dropped);
-                ];
-              sum ~name:"otel.export.errors" ~is_monotonic:true
-                [
-                  int ~start_time_unix_nano:now_unix ~now:now_unix
-                    (Atomic.get n_errors);
-                ];
-            ];
-        ]
-      ) else
-        []
+**Step 2: Implement mk_emitter function (part 1: setup)**
 
-    let send_metrics : Metrics.resource_metrics list sender =
-      {
-        send =
-          (fun m ~ret ->
-            let m = List.rev_append (additional_metrics ()) m in
-            Backend_impl.send_event backend (Event.E_metric m);
-            ret ());
-      }
+Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
 
-    let send_logs : Logs.resource_logs list sender =
-      {
-        send =
-          (fun m ~ret ->
-            Backend_impl.send_event backend (Event.E_logs m);
-            ret ());
-      }
+```ocaml
+(* make an emitter.
+
+   exceptions inside should be caught, see
+   https://opentelemetry.io/docs/reference/specification/error-handling/ *)
+let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
+  let open Proto in
+  let open Lwt.Syntax in
+  (* local helpers *)
+  let open struct
+    let timeout =
+      if config.batch_timeout_ms > 0 then
+        Some Mtime.Span.(config.batch_timeout_ms * ms)
+      else
+        None
+
+    let batch_traces : Trace.resource_spans Batch.t =
+      Batch.make ?batch:config.batch_traces ?timeout ()
+
+    let batch_metrics : Metrics.resource_metrics Batch.t =
+      Batch.make ?batch:config.batch_metrics ?timeout ()
+
+    let batch_logs : Logs.resource_logs Batch.t =
+      Batch.make ?batch:config.batch_logs ?timeout ()
 
     let on_tick_cbs_ = Atomic.make (AList.make ())
 
     let set_on_tick_callbacks = Atomic.set on_tick_cbs_
 
-    let tick () =
-      sample_gc_metrics_if_needed ();
-      Backend_impl.send_event backend Event.E_tick;
-      List.iter (fun f -> f ()) (AList.get @@ Atomic.get on_tick_cbs_)
+    let send_http_ (httpc : Httpc.t) ~url data : unit Lwt.t =
+      let* r = Httpc.send httpc ~url ~decode:(`Ret ()) data in
+      match r with
+      | Ok () -> Lwt.return ()
+      | Error `Sysbreak ->
+        Printf.eprintf "ctrl-c captured, stopping\n%!";
+        Atomic.set stop true;
+        Lwt.return ()
+      | Error err ->
+        (* TODO: log error _via_ otel? *)
+        Atomic.incr n_errors;
+        report_err_ err;
+        (* avoid crazy error loop *)
+        Lwt_unix.sleep 3.
 
-    let cleanup ~on_done () = Backend_impl.shutdown backend ~on_done
+    let send_metrics_http client (l : Metrics.resource_metrics list) =
+      Signal.Encode.metrics l |> send_http_ client ~url:config.url_metrics
+
+    let send_traces_http client (l : Trace.resource_spans list) =
+      Signal.Encode.traces l |> send_http_ client ~url:config.url_traces
+
+    let send_logs_http client (l : Logs.resource_logs list) =
+      Signal.Encode.logs l |> send_http_ client ~url:config.url_logs
+
+    (* emit metrics, if the batch is full or timeout lapsed *)
+    let emit_metrics_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_metrics with
+      | None -> Lwt.return false
+      | Some l ->
+        let batch = !gc_metrics @ l in
+        gc_metrics := [];
+        let+ () = send_metrics_http httpc batch in
+        true
+
+    let emit_traces_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_traces with
+      | None -> Lwt.return false
+      | Some l ->
+        let+ () = send_traces_http httpc l in
+        true
+
+    let emit_logs_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_logs with
+      | None -> Lwt.return false
+      | Some l ->
+        let+ () = send_logs_http httpc l in
+        true
+
+    let[@inline] guard_exn_ where f =
+      try f ()
+      with e ->
+        let bt = Printexc.get_backtrace () in
+        Printf.eprintf
+          "opentelemetry-ocurl-lwt: uncaught exception in %s: %s\n%s\n%!" where
+          (Printexc.to_string e) bt
+
+    let emit_all_force (httpc : Httpc.t) : unit Lwt.t =
+      let now = Mtime_clock.now () in
+      let+ (_ : bool) = emit_traces_maybe ~now ~force:true httpc
+      and+ (_ : bool) = emit_logs_maybe ~now ~force:true httpc
+      and+ (_ : bool) = emit_metrics_maybe ~now ~force:true httpc in
+      ()
+
+    (* thread that calls [tick()] regularly, to help enforce timeouts *)
+    let setup_ticker_thread ~tick ~finally () =
+      let rec tick_thread () =
+        if Atomic.get stop then (
+          finally ();
+          Lwt.return ()
+        ) else
+          let* () = Lwt_unix.sleep 0.5 in
+          let* () = tick () in
+          tick_thread ()
+      in
+      Lwt.async tick_thread
+  end in
+  let httpc = Httpc.create () in
+
+  let module M = struct
+    (* we make sure that this is thread-safe, even though we don't have a
+       background thread. There can still be a ticker thread, and there
+       can also be several user threads that produce spans and call
+       the emit functions. *)
+
+    let push_to_batch b e =
+      match Batch.push b e with
+      | `Ok -> ()
+      | `Dropped -> Atomic.incr n_errors
+
+    let push_trace e =
+      let@ () = guard_exn_ "push trace" in
+      push_to_batch batch_traces e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_traces_maybe ~now httpc in
+          ())
+
+    let push_metrics e =
+      let@ () = guard_exn_ "push metrics" in
+      sample_gc_metrics_if_needed ();
+      push_to_batch batch_metrics e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_metrics_maybe ~now httpc in
+          ())
+
+    let push_logs e =
+      let@ () = guard_exn_ "push logs" in
+      push_to_batch batch_logs e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_logs_maybe ~now httpc in
+          ())
+
+    let set_on_tick_callbacks = set_on_tick_callbacks
+
+    let tick_ () =
+      if Config.Env.get_debug () then
+        Printf.eprintf "tick (from %d)\n%!" (tid ());
+      sample_gc_metrics_if_needed ();
+      List.iter
+        (fun f ->
+          try f ()
+          with e ->
+            Printf.eprintf "on tick callback raised: %s\n"
+              (Printexc.to_string e))
+        (AList.get @@ Atomic.get on_tick_cbs_);
+      let now = Mtime_clock.now () in
+      let+ (_ : bool) = emit_traces_maybe ~now httpc
+      and+ (_ : bool) = emit_logs_maybe ~now httpc
+      and+ (_ : bool) = emit_metrics_maybe ~now httpc in
+      ()
+
+    let () = setup_ticker_thread ~tick:tick_ ~finally:ignore ()
+
+    (* if called in a blocking context: work in the background *)
+    let tick () = Lwt.async tick_
+
+    let cleanup ~on_done () =
+      if Config.Env.get_debug () then
+        Printf.eprintf "opentelemetry: exiting…\n%!";
+      Lwt.async (fun () ->
+          let* () = emit_all_force httpc in
+          Httpc.cleanup httpc;
+          on_done ();
+          Lwt.return ())
   end in
   (module M)
 ```
 
-**Step 2: Add ticker thread and setup functions**
+**Step 3: Build to verify emitter compiles**
 
-Append to `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
+Run: `dune build src/client-ocurl-lwt/`
+Expected: Partial build, may fail on Backend module
+
+**Step 4: Commit**
+
+```bash
+git add src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml
+git commit -m "feat: implement EMITTER with async batching
+
+Add Lwt-based push, emit, and ticker logic
+
+🤖 Generated with Claude Code
+
+Co-Authored-By: Claude <noreply@anthropic.com>"
+```
+
+---
+
+## Task 5: Implement Backend and public API
+
+**Files:**
+- Modify: `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`
+
+**Step 1: Implement Backend functor**
+
+Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
 
 ```ocaml
-(** thread that calls [tick()] regularly, to help enforce timeouts *)
-let setup_ticker_thread ~stop ~sleep_ms (module B : Collector.BACKEND) () =
-  let sleep_s = float sleep_ms /. 1000. in
-  let tick_loop () =
-    try
-      while not @@ Atomic.get stop do
-        Thread.delay sleep_s;
-        B.tick ()
-      done
-    with B_queue.Closed -> ()
+module Backend
+    (Arg : sig
+      val stop : bool Atomic.t
+
+      val config : Config.t
+    end)
+    () : Opentelemetry.Collector.BACKEND = struct
+  include (val mk_emitter ~stop:Arg.stop ~config:Arg.config ())
+
+  open Opentelemetry.Proto
+  open Opentelemetry.Collector
+
+  let send_trace : Trace.resource_spans list sender =
+    {
+      send =
+        (fun l ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send spans %a@."
+               (Format.pp_print_list Trace.pp_resource_spans)
+               l);
+          push_trace l;
+          ret ());
+    }
+
+  let last_sent_metrics = Atomic.make (Mtime_clock.now ())
+
+  let timeout_sent_metrics = Mtime.Span.(5 * s)
+  (* send metrics from time to time *)
+
+  let signal_emit_gc_metrics () =
+    if Config.Env.get_debug () then
+      Printf.eprintf "opentelemetry: emit GC metrics requested\n%!";
+    Atomic.set needs_gc_metrics true
+
+  let additional_metrics () : Metrics.resource_metrics list =
+    (* add exporter metrics to the lot? *)
+    let last_emit = Atomic.get last_sent_metrics in
+    let now = Mtime_clock.now () in
+    let add_own_metrics =
+      let elapsed = Mtime.span last_emit now in
+      Mtime.Span.compare elapsed timeout_sent_metrics > 0
+    in
+
+    (* there is a possible race condition here, as several threads might update
+       metrics at the same time. But that's harmless. *)
+    if add_own_metrics then (
+      Atomic.set last_sent_metrics now;
+      let open OT.Metrics in
+      [
+        make_resource_metrics
+          [
+            sum ~name:"otel.export.dropped" ~is_monotonic:true
+              [
+                int
+                  ~start_time_unix_nano:(Mtime.to_uint64_ns last_emit)
+                  ~now:(Mtime.to_uint64_ns now) (Atomic.get n_dropped);
+              ];
+            sum ~name:"otel.export.errors" ~is_monotonic:true
+              [
+                int
+                  ~start_time_unix_nano:(Mtime.to_uint64_ns last_emit)
+                  ~now:(Mtime.to_uint64_ns now) (Atomic.get n_errors);
+              ];
+          ];
+      ]
+    ) else
+      []
+
+  let send_metrics : Metrics.resource_metrics list sender =
+    {
+      send =
+        (fun m ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send metrics %a@."
+               (Format.pp_print_list Metrics.pp_resource_metrics)
+               m);
+
+          let m = List.rev_append (additional_metrics ()) m in
+          push_metrics m;
+          ret ());
+    }
+
+  let send_logs : Logs.resource_logs list sender =
+    {
+      send =
+        (fun m ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send logs %a@."
+               (Format.pp_print_list Logs.pp_resource_logs)
+               m);
+
+          push_logs m;
+          ret ());
+    }
+end
+```
+
+**Step 2: Implement public API functions**
+
+Continue `src/client-ocurl-lwt/opentelemetry_client_ocurl_lwt.ml`:
+
+```ocaml
+let create_backend ?(stop = Atomic.make false) ?(config = Config.make ()) () =
+  let module B =
+    Backend
+      (struct
+        let stop = stop
+
+        let config = config
+      end)
+      ()
   in
-  start_bg_thread tick_loop
+  (module B : OT.Collector.BACKEND)
 
-let setup_ ?(stop = Atomic.make false) ?(config : Config.t = Config.make ()) ()
-    : unit =
-  let backend = create_backend ~stop ~config () in
-  Opentelemetry.Collector.set_backend backend;
-
-  Self_trace.set_enabled config.common.self_trace;
-
-  if config.ticker_thread then (
-    (* at most a minute *)
-    let sleep_ms = min 60_000 (max 2 config.ticker_interval_ms) in
-    ignore (setup_ticker_thread ~stop ~sleep_ms backend () : Thread.t)
-  )
-
-let remove_backend () : unit =
-  (* we don't need the callback, this runs in the same thread *)
-  OT.Collector.remove_backend () ~on_done:ignore
+let setup_ ?stop ?config () : unit =
+  let backend = create_backend ?stop ?config () in
+  OT.Collector.set_backend backend;
+  ()
 
 let setup ?stop ?config ?(enable = true) () =
   if enable then setup_ ?stop ?config ()
 
-let with_setup ?stop ?config ?(enable = true) () f =
+let remove_backend () : unit Lwt.t =
+  let done_fut, done_u = Lwt.wait () in
+  OT.Collector.remove_backend ~on_done:(fun () -> Lwt.wakeup_later done_u ()) ();
+  done_fut
+
+let with_setup ?stop ?(config = Config.make ()) ?(enable = true) () f : _ Lwt.t
+    =
   if enable then (
-    setup_ ?stop ?config ();
-    Fun.protect ~finally:remove_backend f
+    let open Lwt.Syntax in
+    setup_ ?stop ~config ();
+
+    Lwt.catch
+      (fun () ->
+        let* res = f () in
+        let+ () = remove_backend () in
+        res)
+      (fun exn ->
+        let* () = remove_backend () in
+        reraise exn)
   ) else
     f ()
 ```
@@ -899,9 +822,9 @@ Expected: Generates `opentelemetry-client-ocurl-lwt.opam`
 
 ```bash
 git add src/client-ocurl-lwt/ opentelemetry-client-ocurl-lwt.opam
-git commit -m "feat: complete client-ocurl-lwt public API
+git commit -m "feat: complete client-ocurl-lwt implementation
 
-Add setup, create_backend, and cleanup functions
+Add Backend functor and public API with Lwt
 
 🤖 Generated with Claude Code
 
@@ -933,7 +856,7 @@ Create `tests/ocurl-lwt/dune`:
 
 **Step 3: Create basic URL configuration test**
 
-Create `tests/ocurl-lwt/test_urls.ml` (adapted from client-ocurl tests):
+Create `tests/ocurl-lwt/test_urls.ml`:
 
 ```ocaml
 module OT = Opentelemetry
@@ -942,17 +865,17 @@ module C = Opentelemetry_client_ocurl_lwt
 let () =
   let config1 = C.Config.make () in
   Printf.printf "config1: %a\n%!" C.Config.pp config1;
-  assert (config1.common.url_traces = "http://localhost:4318/v1/traces");
-  assert (config1.common.url_metrics = "http://localhost:4318/v1/metrics");
-  assert (config1.common.url_logs = "http://localhost:4318/v1/logs");
+  assert (config1.url_traces = "http://localhost:4318/v1/traces");
+  assert (config1.url_metrics = "http://localhost:4318/v1/metrics");
+  assert (config1.url_logs = "http://localhost:4318/v1/logs");
   ()
 
 let () =
   let config2 = C.Config.make ~url:"http://example.com:1234" () in
   Printf.printf "config2: %a\n%!" C.Config.pp config2;
-  assert (config2.common.url_traces = "http://example.com:1234/v1/traces");
-  assert (config2.common.url_metrics = "http://example.com:1234/v1/metrics");
-  assert (config2.common.url_logs = "http://example.com:1234/v1/logs");
+  assert (config2.url_traces = "http://example.com:1234/v1/traces");
+  assert (config2.url_metrics = "http://example.com:1234/v1/metrics");
+  assert (config2.url_logs = "http://example.com:1234/v1/logs");
   ()
 
 let () =
@@ -962,16 +885,9 @@ let () =
       ~url_logs:"http://example.com/logs" ()
   in
   Printf.printf "config3: %a\n%!" C.Config.pp config3;
-  assert (config3.common.url_traces = "http://example.com/traces");
-  assert (config3.common.url_metrics = "http://example.com/metrics");
-  assert (config3.common.url_logs = "http://example.com/logs");
-  ()
-
-let () =
-  let config4 = C.Config.make ~bg_threads:8 ~ticker_interval_ms:1000 () in
-  Printf.printf "config4: %a\n%!" C.Config.pp config4;
-  assert (config4.bg_threads = 8);
-  assert (config4.ticker_interval_ms = 1000);
+  assert (config3.url_traces = "http://example.com/traces");
+  assert (config3.url_metrics = "http://example.com/metrics");
+  assert (config3.url_logs = "http://example.com/logs");
   ()
 
 let () = print_endline "All URL tests passed"
@@ -988,7 +904,7 @@ Expected: All tests pass
 git add tests/ocurl-lwt/
 git commit -m "test: add basic tests for client-ocurl-lwt
 
-Test URL configuration and basic setup
+Test URL configuration
 
 🤖 Generated with Claude Code
 
@@ -1004,20 +920,20 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 **Step 1: Add client-ocurl-lwt to documentation**
 
-Modify `CLAUDE.md`, in the "Client Implementations" section (around line 21), add:
+Modify `CLAUDE.md`, in the "Client Implementations" section (around line 21), update to:
 
 ```markdown
 - `src/client-ocurl/` - HTTP client using cURL (synchronous, thread-based)
-- `src/client-ocurl-lwt/` - HTTP client using ezcurl-lwt (threads + Lwt for async HTTP)
-- `src/client-cohttp-lwt/` - HTTP client using cohttp-lwt (asynchronous)
+- `src/client-ocurl-lwt/` - HTTP client using ezcurl-lwt (async Lwt-based)
+- `src/client-cohttp-lwt/` - HTTP client using cohttp-lwt (async Lwt-based)
 ```
 
-And in the "Library Structure" section (around line 57), add:
+And in the "Library Structure" section (around line 57), update to:
 
 ```markdown
-- `opentelemetry-client-ocurl` - cURL-based HTTP collector client
-- `opentelemetry-client-ocurl-lwt` - ezcurl-lwt-based HTTP collector client (threads + Lwt)
-- `opentelemetry-client-cohttp-lwt` - cohttp-lwt HTTP collector client
+- `opentelemetry-client-ocurl` - cURL-based HTTP collector client (thread-based)
+- `opentelemetry-client-ocurl-lwt` - ezcurl-lwt-based HTTP collector client (Lwt async)
+- `opentelemetry-client-cohttp-lwt` - cohttp-lwt HTTP collector client (Lwt async)
 ```
 
 **Step 2: Build to verify all changes**
@@ -1036,7 +952,7 @@ Expected: All tests pass including new client-ocurl-lwt tests
 git add CLAUDE.md
 git commit -m "docs: add client-ocurl-lwt to project documentation
 
-Document new hybrid ezcurl-lwt client
+Document new Lwt-based ezcurl-lwt client
 
 🤖 Generated with Claude Code
 
@@ -1045,7 +961,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ---
 
-## Task 8: Final verification and testing
+## Task 8: Final verification
 
 **Files:**
 - None (verification only)
@@ -1070,35 +986,10 @@ Expected: File exists
 Run: `dune build @install`
 Expected: Build succeeds, installable artifacts created
 
-**Step 5: Manual smoke test (optional)**
+**Step 5: Format code**
 
-Create a simple test program to verify basic functionality works:
-
-```ocaml
-(* test_smoke.ml *)
-module OT = Opentelemetry
-module C = Opentelemetry_client_ocurl_lwt
-
-let () =
-  let stop = Atomic.make false in
-  let config = C.Config.make () in
-  C.setup ~stop ~config ();
-
-  (* Create a simple span *)
-  let@ scope = OT.Trace.with_ "test-span" in
-  Printf.printf "Created test span\n%!";
-
-  (* Give time for background threads to process *)
-  Unix.sleep 1;
-
-  (* Clean shutdown *)
-  Atomic.set stop true;
-  C.remove_backend ();
-  Printf.printf "Smoke test complete\n%!"
-```
-
-Run: `ocamlfind ocamlc -package opentelemetry,opentelemetry-client-ocurl-lwt -linkpkg test_smoke.ml -o test_smoke && ./test_smoke`
-Expected: Runs without errors
+Run: `make format`
+Expected: Code formatted successfully
 
 **Step 6: Final commit**
 
@@ -1106,7 +997,7 @@ Expected: Runs without errors
 git add -A
 git commit -m "feat: complete client-ocurl-lwt implementation
 
-Hybrid client using ezcurl-lwt for async HTTP with thread-based batching
+Fully async Lwt-based client using ezcurl-lwt for HTTP
 
 🤖 Generated with Claude Code
 
@@ -1117,13 +1008,15 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ## Notes
 
-**DRY:** Reused B_queue, Batch modules from client-ocurl. Config pattern from opentelemetry.client.
+**DRY:** Uses opentelemetry.client.Batch and Config. HTTP logic adapted from client-cohttp-lwt pattern.
 
-**YAGNI:** Minimal implementation matching existing client patterns. No extra features.
+**YAGNI:** Minimal implementation matching client-cohttp-lwt architecture. No extra features.
 
-**TDD:** Tests verify configuration and basic setup before complex functionality.
+**TDD:** Tests verify configuration before complex functionality.
 
-**Architecture tradeoffs:**
-- Uses threads for batching (like client-ocurl) + Lwt for HTTP (like client-cohttp-lwt)
-- Bridges Lwt/threads via Lwt.wait + Lwt_main.run in send_http_
-- May have some overhead from bridging, but provides predictable batching with async HTTP
+**Architecture:**
+- Fully Lwt-based, no threads for batching
+- Uses opentelemetry.client.Batch for shared batching logic
+- ezcurl-lwt for async HTTP instead of cohttp-lwt
+- Simpler config (wraps opentelemetry.client.Config.t directly)
+- Async push triggers emit checks, ticker thread ensures timeout-based emits

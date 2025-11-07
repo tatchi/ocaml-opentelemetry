@@ -160,7 +160,8 @@ end = struct
         Lwt.return r
       )
     | Ok (Error (code, msg)) ->
-      Lwt.return @@ Error (`Failure (spf "curl error %s: %s" (Curl.strerror code) msg))
+      Lwt.return
+      @@ Error (`Failure (spf "curl error %s: %s" (Curl.strerror code) msg))
 end
 
 (** An emitter. This is used by {!Backend} below to forward traces/metrics/…
