@@ -31,7 +31,8 @@ val setup :
       after a little while. *)
 
 val remove_backend : unit -> unit Lwt.t
-(** Shutdown current backend *)
+(** Shutdown current backend
+    @since NEXT_RELEASE *)
 
 val with_setup :
   ?stop:bool Atomic.t ->
