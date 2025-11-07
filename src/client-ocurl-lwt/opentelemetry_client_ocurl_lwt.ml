@@ -356,3 +356,144 @@ let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
           Lwt.return ())
   end in
   (module M)
+
+module Backend
+    (Arg : sig
+      val stop : bool Atomic.t
+
+      val config : Config.t
+    end)
+    () : Opentelemetry.Collector.BACKEND = struct
+  include (val mk_emitter ~stop:Arg.stop ~config:Arg.config ())
+
+  open Opentelemetry.Proto
+  open Opentelemetry.Collector
+
+  let send_trace : Trace.resource_spans list sender =
+    {
+      send =
+        (fun l ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send spans %a@."
+               (Format.pp_print_list Trace.pp_resource_spans)
+               l);
+          push_trace l;
+          ret ());
+    }
+
+  let last_sent_metrics = Atomic.make (Mtime_clock.now ())
+
+  let timeout_sent_metrics = Mtime.Span.(5 * s)
+  (* send metrics from time to time *)
+
+  let signal_emit_gc_metrics () =
+    if Config.Env.get_debug () then
+      Printf.eprintf "opentelemetry: emit GC metrics requested\n%!";
+    Atomic.set needs_gc_metrics true
+
+  let additional_metrics () : Metrics.resource_metrics list =
+    (* add exporter metrics to the lot? *)
+    let last_emit = Atomic.get last_sent_metrics in
+    let now = Mtime_clock.now () in
+    let add_own_metrics =
+      let elapsed = Mtime.span last_emit now in
+      Mtime.Span.compare elapsed timeout_sent_metrics > 0
+    in
+
+    (* there is a possible race condition here, as several threads might update
+       metrics at the same time. But that's harmless. *)
+    if add_own_metrics then (
+      Atomic.set last_sent_metrics now;
+      let open OT.Metrics in
+      [
+        make_resource_metrics
+          [
+            sum ~name:"otel.export.dropped" ~is_monotonic:true
+              [
+                int
+                  ~start_time_unix_nano:(Mtime.to_uint64_ns last_emit)
+                  ~now:(Mtime.to_uint64_ns now) (Atomic.get n_dropped);
+              ];
+            sum ~name:"otel.export.errors" ~is_monotonic:true
+              [
+                int
+                  ~start_time_unix_nano:(Mtime.to_uint64_ns last_emit)
+                  ~now:(Mtime.to_uint64_ns now) (Atomic.get n_errors);
+              ];
+          ];
+      ]
+    ) else
+      []
+
+  let send_metrics : Metrics.resource_metrics list sender =
+    {
+      send =
+        (fun m ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send metrics %a@."
+               (Format.pp_print_list Metrics.pp_resource_metrics)
+               m);
+
+          let m = List.rev_append (additional_metrics ()) m in
+          push_metrics m;
+          ret ());
+    }
+
+  let send_logs : Logs.resource_logs list sender =
+    {
+      send =
+        (fun m ~ret ->
+          (if Config.Env.get_debug () then
+             let@ () = Lock.with_lock in
+             Format.eprintf "send logs %a@."
+               (Format.pp_print_list Logs.pp_resource_logs)
+               m);
+
+          push_logs m;
+          ret ());
+    }
+end
+
+let create_backend ?(stop = Atomic.make false) ?(config = Config.make ()) () =
+  let module B =
+    Backend
+      (struct
+        let stop = stop
+
+        let config = config
+      end)
+      ()
+  in
+  (module B : OT.Collector.BACKEND)
+
+let setup_ ?stop ?config () : unit =
+  let backend = create_backend ?stop ?config () in
+  OT.Collector.set_backend backend;
+  ()
+
+let setup ?stop ?config ?(enable = true) () =
+  if enable then setup_ ?stop ?config ()
+
+let remove_backend () : unit Lwt.t =
+  let done_fut, done_u = Lwt.wait () in
+  OT.Collector.remove_backend ~on_done:(fun () -> Lwt.wakeup_later done_u ()) ();
+  done_fut
+
+let with_setup ?stop ?(config = Config.make ()) ?(enable = true) () f : _ Lwt.t
+    =
+  if enable then (
+    let open Lwt.Syntax in
+    setup_ ?stop ~config ();
+
+    Lwt.catch
+      (fun () ->
+        let* res = f () in
+        let+ () = remove_backend () in
+        res)
+      (fun exn ->
+        let* () = remove_backend () in
+        reraise exn)
+  ) else
+    f ()
