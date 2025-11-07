@@ -162,3 +162,198 @@ end = struct
     | Ok (Error (code, msg)) ->
       Lwt.return @@ Error (`Failure (spf "curl error %s: %s" (Curl.strerror code) msg))
 end
+
+(** An emitter. This is used by {!Backend} below to forward traces/metrics/…
+    from the program to whatever collector client we have. *)
+module type EMITTER = sig
+  open Opentelemetry.Proto
+
+  val push_trace : Trace.resource_spans list -> unit
+
+  val push_metrics : Metrics.resource_metrics list -> unit
+
+  val push_logs : Logs.resource_logs list -> unit
+
+  val set_on_tick_callbacks : (unit -> unit) AList.t -> unit
+
+  val tick : unit -> unit
+
+  val cleanup : on_done:(unit -> unit) -> unit -> unit
+end
+
+(* make an emitter.
+
+   exceptions inside should be caught, see
+   https://opentelemetry.io/docs/reference/specification/error-handling/ *)
+let mk_emitter ~stop ~(config : Config.t) () : (module EMITTER) =
+  let open Proto in
+  let open Lwt.Syntax in
+  (* local helpers *)
+  let open struct
+    let timeout =
+      if config.batch_timeout_ms > 0 then
+        Some Mtime.Span.(config.batch_timeout_ms * ms)
+      else
+        None
+
+    let batch_traces : Trace.resource_spans Batch.t =
+      Batch.make ?batch:config.batch_traces ?timeout ()
+
+    let batch_metrics : Metrics.resource_metrics Batch.t =
+      Batch.make ?batch:config.batch_metrics ?timeout ()
+
+    let batch_logs : Logs.resource_logs Batch.t =
+      Batch.make ?batch:config.batch_logs ?timeout ()
+
+    let on_tick_cbs_ = Atomic.make (AList.make ())
+
+    let set_on_tick_callbacks = Atomic.set on_tick_cbs_
+
+    let send_http_ (httpc : Httpc.t) ~url data : unit Lwt.t =
+      let* r = Httpc.send httpc ~url ~decode:(`Ret ()) data in
+      match r with
+      | Ok () -> Lwt.return ()
+      | Error `Sysbreak ->
+        Printf.eprintf "ctrl-c captured, stopping\n%!";
+        Atomic.set stop true;
+        Lwt.return ()
+      | Error err ->
+        (* TODO: log error _via_ otel? *)
+        Atomic.incr n_errors;
+        report_err_ err;
+        (* avoid crazy error loop *)
+        Lwt_unix.sleep 3.
+
+    let send_metrics_http client (l : Metrics.resource_metrics list) =
+      Signal.Encode.metrics l |> send_http_ client ~url:config.url_metrics
+
+    let send_traces_http client (l : Trace.resource_spans list) =
+      Signal.Encode.traces l |> send_http_ client ~url:config.url_traces
+
+    let send_logs_http client (l : Logs.resource_logs list) =
+      Signal.Encode.logs l |> send_http_ client ~url:config.url_logs
+
+    (* emit metrics, if the batch is full or timeout lapsed *)
+    let emit_metrics_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_metrics with
+      | None -> Lwt.return false
+      | Some l ->
+        let batch = !gc_metrics @ l in
+        gc_metrics := [];
+        let+ () = send_metrics_http httpc batch in
+        true
+
+    let emit_traces_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_traces with
+      | None -> Lwt.return false
+      | Some l ->
+        let+ () = send_traces_http httpc l in
+        true
+
+    let emit_logs_maybe ~now ?force httpc : bool Lwt.t =
+      match Batch.pop_if_ready ?force ~now batch_logs with
+      | None -> Lwt.return false
+      | Some l ->
+        let+ () = send_logs_http httpc l in
+        true
+
+    let[@inline] guard_exn_ where f =
+      try f ()
+      with e ->
+        let bt = Printexc.get_backtrace () in
+        Printf.eprintf
+          "opentelemetry-ocurl-lwt: uncaught exception in %s: %s\n%s\n%!" where
+          (Printexc.to_string e) bt
+
+    let emit_all_force (httpc : Httpc.t) : unit Lwt.t =
+      let now = Mtime_clock.now () in
+      let+ (_ : bool) = emit_traces_maybe ~now ~force:true httpc
+      and+ (_ : bool) = emit_logs_maybe ~now ~force:true httpc
+      and+ (_ : bool) = emit_metrics_maybe ~now ~force:true httpc in
+      ()
+
+    (* thread that calls [tick()] regularly, to help enforce timeouts *)
+    let setup_ticker_thread ~tick ~finally () =
+      let rec tick_thread () =
+        if Atomic.get stop then (
+          finally ();
+          Lwt.return ()
+        ) else
+          let* () = Lwt_unix.sleep 0.5 in
+          let* () = tick () in
+          tick_thread ()
+      in
+      Lwt.async tick_thread
+  end in
+  let httpc = Httpc.create () in
+
+  let module M = struct
+    (* we make sure that this is thread-safe, even though we don't have a
+       background thread. There can still be a ticker thread, and there
+       can also be several user threads that produce spans and call
+       the emit functions. *)
+
+    let push_to_batch b e =
+      match Batch.push b e with
+      | `Ok -> ()
+      | `Dropped -> Atomic.incr n_errors
+
+    let push_trace e =
+      let@ () = guard_exn_ "push trace" in
+      push_to_batch batch_traces e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_traces_maybe ~now httpc in
+          ())
+
+    let push_metrics e =
+      let@ () = guard_exn_ "push metrics" in
+      sample_gc_metrics_if_needed ();
+      push_to_batch batch_metrics e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_metrics_maybe ~now httpc in
+          ())
+
+    let push_logs e =
+      let@ () = guard_exn_ "push logs" in
+      push_to_batch batch_logs e;
+      let now = Mtime_clock.now () in
+      Lwt.async (fun () ->
+          let+ (_ : bool) = emit_logs_maybe ~now httpc in
+          ())
+
+    let set_on_tick_callbacks = set_on_tick_callbacks
+
+    let tick_ () =
+      if Config.Env.get_debug () then
+        Printf.eprintf "tick (from %d)\n%!" (tid ());
+      sample_gc_metrics_if_needed ();
+      List.iter
+        (fun f ->
+          try f ()
+          with e ->
+            Printf.eprintf "on tick callback raised: %s\n"
+              (Printexc.to_string e))
+        (AList.get @@ Atomic.get on_tick_cbs_);
+      let now = Mtime_clock.now () in
+      let+ (_ : bool) = emit_traces_maybe ~now httpc
+      and+ (_ : bool) = emit_logs_maybe ~now httpc
+      and+ (_ : bool) = emit_metrics_maybe ~now httpc in
+      ()
+
+    let () = setup_ticker_thread ~tick:tick_ ~finally:ignore ()
+
+    (* if called in a blocking context: work in the background *)
+    let tick () = Lwt.async tick_
+
+    let cleanup ~on_done () =
+      if Config.Env.get_debug () then
+        Printf.eprintf "opentelemetry: exiting…\n%!";
+      Lwt.async (fun () ->
+          let* () = emit_all_force httpc in
+          Httpc.cleanup httpc;
+          on_done ();
+          Lwt.return ())
+  end in
+  (module M)
